@@ -20,6 +20,32 @@ const environmentSchema = z.object({
   JWT_SECRET: z
     .string()
     .min(32, "JWT_SECRET doit contenir au moins 32 caractères."),
+
+  RESEND_API_KEY: z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    z.string().trim().min(1).optional(),
+  ),
+
+  EMAIL_FROM: z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    z.string().trim().min(3).optional(),
+  ),
+
+  APP_ORIGIN: z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    z.url()
+      .refine((value) => {
+        const url = new URL(value)
+        return (
+          url.pathname === "/" &&
+          !url.search &&
+          !url.hash &&
+          !url.username &&
+          !url.password
+        )
+      })
+      .optional(),
+  ),
 })
 
 const result = environmentSchema.safeParse(process.env)

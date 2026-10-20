@@ -6,11 +6,13 @@ import { authenticate, requireAnyCapability, requireTenant } from "../auth.js"
 
 import { pool } from "../db.js"
 
+import { writeAuditLog } from "../audit-log.js"
+
 import type { AuthenticatedRequest } from "../types.js"
 
 const router = Router()
 
-router.use(authenticate, requireAnyCapability("manage_finance"))
+router.use(authenticate)
 
 const paymentSchema = z.object({
   siteId: z.uuid(),
@@ -52,7 +54,7 @@ const transitions: Record<string, string[]> = {
   Refusé: [],
 }
 
-router.get("/", async (request, response) => {
+router.get("/", requireAnyCapability("manage_finance", "read_finance"), async (request, response) => {
   const userRequest = request as AuthenticatedRequest
 
   const tenantId = requireTenant(userRequest, response)
@@ -85,7 +87,7 @@ router.get("/", async (request, response) => {
   response.json({ data: entries.rows, summary: summary.rows })
 })
 
-router.post("/", async (request, response) => {
+router.post("/", requireAnyCapability("manage_finance"), async (request, response) => {
   const userRequest = request as AuthenticatedRequest
 
   const tenantId = requireTenant(userRequest, response)
@@ -124,36 +126,51 @@ router.post("/", async (request, response) => {
             lpad(nextval('payment_dossier_reference_seq')::text, 6, '0') AS reference`,
   )
 
-  const result = await pool.query(
-    `INSERT INTO payment_dossiers (
-       tenant_id, site_id, created_by, reference, subject, amount_fcfa, due_date
-     )
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     RETURNING id, reference, site_id AS "siteId", subject,
-               amount_fcfa AS "amountFcfa", status, due_date AS "dueDate",
-               created_at AS "createdAt", updated_at AS "updatedAt"`,
-
-    [
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    const result = await client.query(
+      `INSERT INTO payment_dossiers (
+         tenant_id, site_id, created_by, reference, subject, amount_fcfa, due_date
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, reference, site_id AS "siteId", subject,
+                 amount_fcfa AS "amountFcfa", status, due_date AS "dueDate",
+                 created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [
+        tenantId,
+        dossier.siteId,
+        userRequest.authUser.id,
+        referenceResult.rows[0]!.reference,
+        dossier.subject,
+        dossier.amountFcfa,
+        dossier.dueDate ?? null,
+      ],
+    )
+    await writeAuditLog(client, request, {
+      actorId: userRequest.authUser.id,
+      actorRole: userRequest.authUser.role,
       tenantId,
-
-      dossier.siteId,
-
-      userRequest.authUser.id,
-
-      referenceResult.rows[0]!.reference,
-
-      dossier.subject,
-
-      dossier.amountFcfa,
-
-      dossier.dueDate ?? null,
-    ],
-  )
-
-  response.status(201).json({ data: result.rows[0] })
+      targetType: "payment_dossier",
+      targetId: result.rows[0].id,
+      action: "PAYMENT_DOSSIER_CREATED",
+      payloadMasked: {
+        reference: result.rows[0].reference,
+        siteId: dossier.siteId,
+        amountFcfa: dossier.amountFcfa,
+      },
+    })
+    await client.query("COMMIT")
+    response.status(201).json({ data: result.rows[0] })
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  } finally {
+    client.release()
+  }
 })
 
-router.patch("/:id/status", async (request, response) => {
+router.patch("/:id/status", requireAnyCapability("manage_finance"), async (request, response) => {
   const userRequest = request as AuthenticatedRequest
 
   const tenantId = requireTenant(userRequest, response)
@@ -172,38 +189,53 @@ router.patch("/:id/status", async (request, response) => {
     return
   }
 
-  const current = await pool.query<{ status: string }>(
-    "SELECT status FROM payment_dossiers WHERE id = $1 AND tenant_id = $2",
-
-    [id.data, tenantId],
-  )
-
-  const existing = current.rows[0]
-
-  if (!existing) {
-    response.status(404).json({ error: "Dossier de paiement introuvable." })
-
-    return
-  }
-
-  if (!transitions[existing.status]?.includes(parsed.data.status)) {
-    response.status(409).json({
-      error: `Transition impossible : ${existing.status} vers ${parsed.data.status}.`,
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    const current = await client.query<{ status: string }>(
+      "SELECT status FROM payment_dossiers WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+      [id.data, tenantId],
+    )
+    const existing = current.rows[0]
+    if (!existing) {
+      await client.query("ROLLBACK")
+      response.status(404).json({ error: "Dossier de paiement introuvable." })
+      return
+    }
+    if (!transitions[existing.status]?.includes(parsed.data.status)) {
+      await client.query("ROLLBACK")
+      response.status(409).json({
+        error: `Transition impossible : ${existing.status} vers ${parsed.data.status}.`,
+      })
+      return
+    }
+    const result = await client.query(
+      `UPDATE payment_dossiers
+       SET status = $1, updated_at = now()
+       WHERE id = $2 AND tenant_id = $3
+       RETURNING id, status, updated_at AS "updatedAt"`,
+      [parsed.data.status, id.data, tenantId],
+    )
+    await writeAuditLog(client, request, {
+      actorId: userRequest.authUser.id,
+      actorRole: userRequest.authUser.role,
+      tenantId,
+      targetType: "payment_dossier",
+      targetId: id.data,
+      action: "PAYMENT_DOSSIER_STATUS_CHANGED",
+      payloadMasked: {
+        previousStatus: existing.status,
+        status: parsed.data.status,
+      },
     })
-
-    return
+    await client.query("COMMIT")
+    response.json({ data: result.rows[0] })
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  } finally {
+    client.release()
   }
-
-  const result = await pool.query(
-    `UPDATE payment_dossiers
-     SET status = $1, updated_at = now()
-     WHERE id = $2 AND tenant_id = $3
-     RETURNING id, status, updated_at AS "updatedAt"`,
-
-    [parsed.data.status, id.data, tenantId],
-  )
-
-  response.json({ data: result.rows[0] })
 })
 
 export default router

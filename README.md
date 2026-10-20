@@ -23,6 +23,10 @@ Ne commitez jamais `.env`, et ne lancez pas les données de démonstration en pr
 
 Configurez les variables runtime dans le gestionnaire de secrets de l’hébergeur. Appliquez les migrations SQL de `migrations/` à Supabase une seule fois, dans l’ordre numérique, avant d’ouvrir l’API au public. `npm run migrate` utilise `DATABASE_URL` et `DATABASE_SSL`; vérifiez d’abord l’impact des migrations sur une base de recette. N’exécutez jamais `npm run seed` en production.
 
+La migration `010_platform_administration.sql` ajoute les journaux d’audit, les jetons de réinitialisation, le consentement aux accès support et les affectations chantier. La migration `011_temporary_password_and_storage_limits.sql` ajoute l’obligation de changer le mot de passe provisoire à la première connexion et les limites de stockage des plans. Les scripts de retour arrière sont dans `migrations/rollback/`; ils sont manuels et doivent être évalués avant exécution.
+
+L’accès d’un tenant est valable jusqu’à la date `renews_at` incluse; dès le lendemain, la connexion et les routes authentifiées sont refusées. Un abonnement `Actif` ou `Essai` doit avoir une date de fin valide; une date absente ou échue bloque l’accès. Vérifiez les abonnements existants avant le déploiement et ne déduisez pas de durée historique.
+
 L’hébergeur doit fournir une URL HTTPS publique. Le Worker Cloudflare transmet cookies, méthode, chemin, query string et corps HTTP au backend.
 
 ## Développement local
