@@ -6,9 +6,13 @@ import { Router } from "express"
 
 import { z } from "zod"
 
+import type { QueryResult } from "pg"
+
 import { authenticate, requireAnyCapability, requireTenant } from "../auth.js"
 
 import { pool } from "../db.js"
+
+import { writeAuditLog } from "../audit-log.js"
 
 import { roleAccess, siteScopedRoles } from "../role-access.js"
 
@@ -181,7 +185,7 @@ const siteSchema = z.object({
 
   location: z.string().trim().min(2).max(160),
 
-  status: z.enum(["En cours", "En pause", "Terminé"]).default("En cours"),
+  status: z.enum(["En cours", "En pause", "Terminé", "Archivé"]).default("En cours"),
 
   progress: z.number().int().min(0).max(100).default(0),
 
@@ -318,6 +322,8 @@ const createMemberSchema = z.object({
 
   role: managedRoleSchema,
 
+  assignedSiteId: z.uuid().nullable().optional(),
+
   assignedSite: z.string().trim().min(2).max(120).nullable().optional(),
 
   temporaryPassword: z.string().min(12).max(128),
@@ -326,9 +332,17 @@ const createMemberSchema = z.object({
 const updateMemberSchema = z.object({
   role: managedRoleSchema,
 
-  assignedSite: z.string().trim().min(2).max(120).nullable(),
+  assignedSiteId: z.uuid().nullable().optional(),
+
+  assignedSite: z.string().trim().min(2).max(120).nullable().optional(),
 
   active: z.boolean(),
+})
+
+const teamProfileSchema = z.object({
+  fullName: z.string().trim().min(2).max(120),
+  email: z.email().trim().toLowerCase(),
+  phone: z.string().trim().min(7).max(30).nullable(),
 })
 
 function initialsFromName(name: string) {
@@ -341,6 +355,26 @@ function initialsFromName(name: string) {
     .map((part) => part[0]!.toLocaleUpperCase("fr-FR"))
 
     .join("")
+}
+
+async function findAssignedSite(
+  tenantId: string,
+  siteId: string | null | undefined,
+  legacyName: string | null | undefined,
+) {
+  if (siteId) {
+    const result = await pool.query<{ id: string; name: string }>(
+      `SELECT id, name FROM sites WHERE id = $1 AND tenant_id = $2 AND status <> 'Archivé'`,
+      [siteId, tenantId],
+    )
+    return result.rows[0] ?? null
+  }
+  if (!legacyName) return null
+  const result = await pool.query<{ id: string; name: string }>(
+    `SELECT id, name FROM sites WHERE tenant_id = $1 AND name = $2 AND status <> 'Archivé' ORDER BY created_at LIMIT 2`,
+    [tenantId, legacyName.trim()],
+  )
+  return result.rowCount === 1 ? result.rows[0]! : null
 }
 
 router.get(
@@ -361,15 +395,18 @@ router.get(
     const result = await pool.query(
       `SELECT u.id, u.email, u.phone, u.full_name AS "fullName",
               u.initials, u.role, u.role_label AS "roleLabel",
-              u.assigned_site AS "assignedSite", u.active,
+              COALESCE(assigned.name, u.assigned_site) AS "assignedSite",
+              u.assigned_site_id AS "assignedSiteId", u.active,
               u.created_at AS "createdAt"
        FROM users u
+       LEFT JOIN sites assigned
+         ON assigned.id = u.assigned_site_id AND assigned.tenant_id = u.tenant_id
        WHERE u.tenant_id = $1
          AND ($5::boolean OR u.active = true)
          AND (
               $2::boolean
               OR u.id = $3
-              OR ($4::text IS NOT NULL AND u.assigned_site = $4)
+              OR ($4::uuid IS NOT NULL AND u.assigned_site_id = $4)
          )
        ORDER BY u.active DESC, u.full_name`,
 
@@ -380,7 +417,7 @@ router.get(
 
         userRequest.authUser.id,
 
-        userRequest.authUser.assignedSite,
+        userRequest.authUser.assignedSiteId,
 
         userRequest.authUser.capabilities.includes("manage_team"),
       ],
@@ -418,46 +455,52 @@ router.post(
 
     const access = roleAccess[member.role]
 
-    const assignedSite = member.assignedSite?.trim() || null
+    const assignedSite = await findAssignedSite(
+      tenantId,
+      member.assignedSiteId,
+      member.assignedSite ?? null,
+    )
 
     const siteRequired = siteScopedRoles.includes(member.role)
 
-    if (siteRequired && !assignedSite) {
+    if ((siteRequired || member.assignedSiteId || member.assignedSite) && !assignedSite) {
       response
         .status(400)
-        .json({ error: "Un chantier doit être affecté à ce rôle." })
+        .json({ error: "Le chantier doit appartenir à cette entreprise et être sélectionné sans ambiguïté." })
 
       return
     }
 
-    if (assignedSite) {
-      const site = await pool.query(
-        "SELECT 1 FROM sites WHERE tenant_id = $1 AND name = $2",
-
-        [tenantId, assignedSite],
-      )
-
-      if (!site.rowCount) {
-        response.status(400).json({
-          error: "Le chantier choisi n’appartient pas à cette entreprise.",
-        })
-
-        return
-      }
-    }
-
     const passwordHash = await bcrypt.hash(member.temporaryPassword, 12)
 
+    const client = await pool.connect()
     try {
-      const result = await pool.query(
+      await client.query("BEGIN")
+      await client.query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE", [tenantId])
+      const plan = await client.query<{ max_users: number | null }>(
+        `SELECT p.max_users FROM tenant_subscriptions ts
+         JOIN subscription_plans p ON p.id = ts.plan_id WHERE ts.tenant_id = $1`,
+        [tenantId],
+      )
+      const userCount = await client.query<{ count: number }>(
+        "SELECT count(*)::int AS count FROM users WHERE tenant_id = $1 AND active",
+        [tenantId],
+      )
+      if (plan.rows[0]?.max_users !== null && plan.rows[0]?.max_users !== undefined && userCount.rows[0]!.count >= plan.rows[0].max_users) {
+        await client.query("ROLLBACK")
+        response.status(409).json({ error: "La limite d’utilisateurs de votre offre est atteinte." })
+        return
+      }
+      const result = await client.query(
         `INSERT INTO users (
            tenant_id, email, phone, password_hash, full_name, initials,
-           role, role_label, tenant_name, tenant_plan, assigned_site,
+           role, role_label, tenant_name, tenant_plan, assigned_site, assigned_site_id,
            sections, capabilities
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          RETURNING id, email, phone, full_name AS "fullName", initials,
                    role, role_label AS "roleLabel", assigned_site AS "assignedSite",
+                   assigned_site_id AS "assignedSiteId",
                    active, created_at AS "createdAt"`,
 
         [
@@ -481,7 +524,9 @@ router.post(
 
           userRequest.authUser.tenantPlan,
 
-          assignedSite,
+          assignedSite?.name ?? null,
+
+          assignedSite?.id ?? null,
 
           JSON.stringify(access.sections),
 
@@ -489,8 +534,19 @@ router.post(
         ],
       )
 
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "user",
+        targetId: result.rows[0].id,
+        action: "TEAM_MEMBER_CREATED",
+        payloadMasked: { role: member.role, assignedSiteId: assignedSite?.id ?? null },
+      })
+      await client.query("COMMIT")
       response.status(201).json({ data: result.rows[0] })
     } catch (error) {
+      await client.query("ROLLBACK")
       if (
         typeof error === "object" &&
         error !== null &&
@@ -505,6 +561,8 @@ router.post(
       }
 
       throw error
+    } finally {
+      client.release()
     }
   },
 )
@@ -543,39 +601,37 @@ router.patch(
 
     const access = roleAccess[member.role]
 
-    const assignedSite = member.assignedSite?.trim() || null
+    const assignedSite = await findAssignedSite(
+      tenantId,
+      member.assignedSiteId,
+      member.assignedSite ?? null,
+    )
 
-    if (siteScopedRoles.includes(member.role) && !assignedSite) {
+    if ((siteScopedRoles.includes(member.role) || member.assignedSiteId || member.assignedSite) && !assignedSite) {
       response
         .status(400)
-        .json({ error: "Un chantier doit être affecté à ce rôle." })
+        .json({ error: "Le chantier doit appartenir à cette entreprise et être sélectionné sans ambiguïté." })
 
       return
     }
 
-    if (assignedSite) {
-      const site = await pool.query(
-        "SELECT 1 FROM sites WHERE tenant_id = $1 AND name = $2",
-
-        [tenantId, assignedSite],
-      )
-
-      if (!site.rowCount) {
-        response.status(400).json({
-          error: "Le chantier choisi n’appartient pas à cette entreprise.",
-        })
-
-        return
-      }
-    }
-
-    const result = await pool.query(
+    const client = await pool.connect()
+    let result: QueryResult<{
+      id: string; email: string; phone: string | null; fullName: string; initials: string;
+      role: UserRole; roleLabel: string; assignedSite: string | null;
+      assignedSiteId: string | null; active: boolean; createdAt: Date
+    }>
+    try {
+      await client.query("BEGIN")
+      result = await client.query(
       `UPDATE users
-       SET role = $1, role_label = $2, assigned_site = $3, active = $4,
-           sections = $5, capabilities = $6
-       WHERE id = $7 AND tenant_id = $8 AND role <> 'ADMIN_ENTERPRISE'
+       SET role = $1, role_label = $2, assigned_site = $3, assigned_site_id = $4, active = $5,
+           session_version = session_version + CASE WHEN $5 THEN 0 ELSE 1 END,
+           sections = $6, capabilities = $7
+       WHERE id = $8 AND tenant_id = $9 AND role <> 'ADMIN_ENTERPRISE'
        RETURNING id, email, phone, full_name AS "fullName", initials,
                  role, role_label AS "roleLabel", assigned_site AS "assignedSite",
+                 assigned_site_id AS "assignedSiteId",
                  active, created_at AS "createdAt"`,
 
       [
@@ -583,7 +639,9 @@ router.patch(
 
         access.label,
 
-        assignedSite,
+        assignedSite?.name ?? null,
+
+        assignedSite?.id ?? null,
 
         member.active,
 
@@ -595,9 +653,10 @@ router.patch(
 
         tenantId,
       ],
-    )
+      )
 
     if (!result.rowCount) {
+      await client.query("ROLLBACK")
       response
         .status(404)
         .json({ error: "Membre introuvable ou accès protégé." })
@@ -605,7 +664,80 @@ router.patch(
       return
     }
 
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "user",
+        targetId: id.data,
+        action: "TEAM_MEMBER_UPDATED",
+        payloadMasked: { role: member.role, active: member.active, assignedSiteId: assignedSite?.id ?? null },
+      })
+      await client.query("COMMIT")
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+
     response.json({ data: result.rows[0] })
+  },
+)
+
+router.patch(
+  "/team/:id/profile",
+  requireAnyCapability("manage_team"),
+  async (request, response) => {
+    const userRequest = request as AuthenticatedRequest
+    const tenantId = requireTenant(userRequest, response)
+    if (!tenantId) return
+    const id = z.uuid().safeParse(request.params.id)
+    const parsed = teamProfileSchema.safeParse(request.body)
+    if (!id.success || !parsed.success) {
+      response.status(400).json({ error: "Profil de membre invalide." })
+      return
+    }
+    if (id.data === userRequest.authUser.id) {
+      response.status(400).json({ error: "Modifiez vos propres coordonnées dans Profil." })
+      return
+    }
+    const member = parsed.data
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const result = await client.query(
+        `UPDATE users SET full_name = $1, initials = $2, email = $3, phone = $4
+         WHERE id = $5 AND tenant_id = $6 AND role <> 'ADMIN_ENTERPRISE'
+         RETURNING id, full_name AS "fullName", role, active`,
+        [member.fullName, initialsFromName(member.fullName), member.email, member.phone || null, id.data, tenantId],
+      )
+      if (!result.rowCount) {
+        await client.query("ROLLBACK")
+        response.status(404).json({ error: "Membre introuvable ou protégé." })
+        return
+      }
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "user",
+        targetId: id.data,
+        action: "TEAM_MEMBER_PROFILE_UPDATED",
+        payloadMasked: { fullName: member.fullName, email: "masqué", phone: member.phone ? "masqué" : null },
+      })
+      await client.query("COMMIT")
+      response.json({ data: result.rows[0] })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
+        response.status(409).json({ error: "Cet email ou ce téléphone est déjà utilisé." })
+        return
+      }
+      throw error
+    } finally {
+      client.release()
+    }
   },
 )
 
@@ -637,23 +769,41 @@ router.delete(
       return
     }
 
-    const result = await pool.query(
-      `UPDATE users
-       SET active = false
-       WHERE id = $1 AND tenant_id = $2 AND role <> 'ADMIN_ENTERPRISE'
-       RETURNING id, email, phone, full_name AS "fullName", initials,
-                 role, role_label AS "roleLabel", assigned_site AS "assignedSite",
-                 active, created_at AS "createdAt"`,
-
-      [id.data, tenantId],
-    )
-
-    if (!result.rowCount) {
-      response
-        .status(404)
-        .json({ error: "Membre introuvable ou compte protégé." })
-
-      return
+    const client = await pool.connect()
+    let result: QueryResult<{
+      id: string; email: string; phone: string | null; fullName: string; initials: string;
+      role: UserRole; roleLabel: string; assignedSite: string | null; active: boolean; createdAt: Date
+    }>
+    try {
+      await client.query("BEGIN")
+      result = await client.query(
+        `UPDATE users SET active = false, session_version = session_version + 1
+         WHERE id = $1 AND tenant_id = $2 AND role <> 'ADMIN_ENTERPRISE'
+         RETURNING id, email, phone, full_name AS "fullName", initials,
+                   role, role_label AS "roleLabel", assigned_site AS "assignedSite",
+                   active, created_at AS "createdAt"`,
+        [id.data, tenantId],
+      )
+      if (!result.rowCount) {
+        await client.query("ROLLBACK")
+        response.status(404).json({ error: "Membre introuvable ou compte protégé." })
+        return
+      }
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "user",
+        targetId: id.data,
+        action: "TEAM_MEMBER_DEACTIVATED",
+        payloadMasked: { active: false },
+      })
+      await client.query("COMMIT")
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
     }
 
     response.json({ data: result.rows[0] })
@@ -663,7 +813,7 @@ router.delete(
 router.get(
   "/sites",
 
-  requireAnyCapability("manage_sites", "manage_finance", "read_assigned"),
+  requireAnyCapability("manage_sites", "manage_finance", "read_finance", "read_assigned"),
 
   async (request, response) => {
     const userRequest = request as AuthenticatedRequest
@@ -674,10 +824,12 @@ router.get(
 
     const canReadAll =
       userRequest.authUser.capabilities.includes("manage_sites") ||
-      userRequest.authUser.capabilities.includes("manage_finance")
+      userRequest.authUser.capabilities.includes("manage_finance") ||
+      userRequest.authUser.capabilities.includes("read_finance")
 
     const canReadBudget =
-      userRequest.authUser.capabilities.includes("manage_finance")
+      userRequest.authUser.capabilities.includes("manage_finance") ||
+      userRequest.authUser.capabilities.includes("read_finance")
 
     const canReadSiteDetails =
       userRequest.authUser.capabilities.includes("manage_sites") ||
@@ -692,24 +844,61 @@ router.get(
                CASE WHEN $5::boolean THEN s.start_date ELSE NULL END AS "startDate",
                CASE WHEN $5::boolean THEN s.end_date ELSE NULL END AS "endDate",
                s.created_at AS "createdAt",
-               CASE WHEN $5::boolean THEN COUNT(DISTINCT t.assigned_to)::integer ELSE NULL END AS "teamCount"
+               CASE WHEN $5::boolean THEN (
+                 SELECT count(*)::integer FROM users assigned_user
+                 WHERE assigned_user.assigned_site_id = s.id
+                   AND assigned_user.tenant_id = s.tenant_id AND assigned_user.active
+               ) ELSE NULL END AS "teamCount"
        FROM sites s
-       LEFT JOIN tasks t ON t.site_id = s.id AND t.tenant_id = s.tenant_id
        WHERE s.tenant_id = $1
-          AND ($2::boolean OR s.name = $3)
+          AND ($2::boolean OR s.id = $3::uuid)
        GROUP BY s.id
        ORDER BY s.created_at DESC`,
 
       [
         tenantId,
         canReadAll,
-        userRequest.authUser.assignedSite,
+        userRequest.authUser.assignedSiteId,
         canReadBudget,
         canReadSiteDetails,
       ],
     )
 
     response.json({ data: result.rows })
+  },
+)
+
+router.get(
+  "/sites/:id",
+  requireAnyCapability("manage_sites"),
+  async (request, response) => {
+    const userRequest = request as AuthenticatedRequest
+    const tenantId = requireTenant(userRequest, response)
+    if (!tenantId) return
+    const id = z.uuid().safeParse(request.params.id)
+    if (!id.success) {
+      response.status(400).json({ error: "Identifiant de chantier invalide." })
+      return
+    }
+    const result = await pool.query(
+      `SELECT s.id, s.name, s.location, s.status, s.progress,
+              s.budget_fcfa AS "budgetFcfa", s.start_date AS "startDate",
+              s.end_date AS "endDate", s.created_at AS "createdAt",
+              COALESCE(jsonb_agg(jsonb_build_object(
+                'id', u.id, 'fullName', u.full_name, 'role', u.role, 'active', u.active
+              )) FILTER (WHERE u.id IS NOT NULL), '[]'::jsonb) AS "assignedTeam",
+              count(u.id) FILTER (WHERE u.active)::int AS "teamCount"
+       FROM sites s
+       LEFT JOIN users u ON u.assigned_site_id = s.id AND u.tenant_id = s.tenant_id
+       WHERE s.id = $1 AND s.tenant_id = $2
+       GROUP BY s.id`,
+      [id.data, tenantId],
+    )
+    if (!result.rowCount) {
+      response.status(404).json({ error: "Chantier introuvable." })
+      return
+    }
+    response.json({ data: result.rows[0] })
   },
 )
 
@@ -738,7 +927,26 @@ router.post(
 
     const site = parsed.data
 
-    const result = await pool.query(
+    const client = await pool.connect()
+    let result
+    try {
+      await client.query("BEGIN")
+      await client.query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE", [tenantId])
+      const plan = await client.query<{ max_sites: number | null }>(
+        `SELECT p.max_sites FROM tenant_subscriptions ts
+         JOIN subscription_plans p ON p.id = ts.plan_id WHERE ts.tenant_id = $1`,
+        [tenantId],
+      )
+      const siteCount = await client.query<{ count: number }>(
+        "SELECT count(*)::int AS count FROM sites WHERE tenant_id = $1 AND status <> 'Archivé'",
+        [tenantId],
+      )
+      if (plan.rows[0]?.max_sites !== null && plan.rows[0]?.max_sites !== undefined && siteCount.rows[0]!.count >= plan.rows[0].max_sites) {
+        await client.query("ROLLBACK")
+        response.status(409).json({ error: "La limite de chantiers de votre offre est atteinte." })
+        return
+      }
+      result = await client.query(
       `INSERT INTO sites (tenant_id, name, location, status, progress, budget_fcfa, start_date, end_date)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id, name, location, status, progress, budget_fcfa AS "budgetFcfa",
@@ -755,9 +963,76 @@ router.post(
         site.startDate ?? null,
         site.endDate ?? null,
       ],
-    )
+      )
+
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "site",
+        targetId: result.rows[0].id,
+        action: "SITE_CREATED",
+        payloadMasked: { name: site.name, status: site.status },
+      })
+      await client.query("COMMIT")
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
 
     response.status(201).json({ data: result.rows[0] })
+  },
+)
+
+router.patch(
+  "/sites/:id",
+  requireAnyCapability("manage_sites"),
+  async (request, response) => {
+    const userRequest = request as AuthenticatedRequest
+    const tenantId = requireTenant(userRequest, response)
+    if (!tenantId) return
+    const id = z.uuid().safeParse(request.params.id)
+    const parsed = siteSchema.safeParse(request.body)
+    if (!id.success || !parsed.success) {
+      response.status(400).json({ error: "Mise à jour du chantier invalide." })
+      return
+    }
+    const site = parsed.data
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const result = await client.query(
+        `UPDATE sites SET name = $1, location = $2, status = $3, progress = $4,
+                budget_fcfa = $5, start_date = $6, end_date = $7
+         WHERE id = $8 AND tenant_id = $9
+         RETURNING id, name, location, status, progress, budget_fcfa AS "budgetFcfa",
+                   start_date AS "startDate", end_date AS "endDate", created_at AS "createdAt"`,
+        [site.name, site.location, site.status, site.progress, site.budgetFcfa, site.startDate ?? null, site.endDate ?? null, id.data, tenantId],
+      )
+      if (!result.rowCount) {
+        await client.query("ROLLBACK")
+        response.status(404).json({ error: "Chantier introuvable." })
+        return
+      }
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "site",
+        targetId: id.data,
+        action: site.status === "Archivé" ? "SITE_ARCHIVED" : "SITE_UPDATED",
+        payloadMasked: { name: site.name, status: site.status },
+      })
+      await client.query("COMMIT")
+      response.json({ data: result.rows[0] })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
   },
 )
 
@@ -778,7 +1053,7 @@ router.get(
 
     const canManageAssignedSite =
       userRequest.authUser.capabilities.includes("manage_tasks") &&
-      userRequest.authUser.assignedSite !== null
+      userRequest.authUser.assignedSiteId !== null
 
     const result = await pool.query(
       `SELECT t.id, t.site_id AS "siteId", s.name AS "siteName", t.title,
@@ -793,7 +1068,7 @@ router.get(
          AND (
            $2::boolean
            OR (
-             s.name = $5
+             s.id = $5::uuid
              AND ($4::boolean OR t.assigned_to = $3)
            )
          )
@@ -804,7 +1079,7 @@ router.get(
         canReadAll,
         userRequest.authUser.id,
         canManageAssignedSite,
-        userRequest.authUser.assignedSite,
+        userRequest.authUser.assignedSiteId,
       ],
     )
 
@@ -840,7 +1115,8 @@ router.post(
     const site = await pool.query(
       `SELECT 1 FROM sites
        WHERE id = $1 AND tenant_id = $2
-         AND ($3::boolean OR name = $4)`,
+         AND ($3::boolean OR id = $4::uuid)
+         AND status <> 'Archivé'`,
 
       [
         task.siteId,
@@ -849,7 +1125,7 @@ router.post(
 
         userRequest.authUser.capabilities.includes("read_company"),
 
-        userRequest.authUser.assignedSite,
+        userRequest.authUser.assignedSiteId,
       ],
     )
 
@@ -866,11 +1142,9 @@ router.post(
          WHERE u.id = $1 AND u.tenant_id = $2 AND u.active = true
            AND (
              u.role::text <> ALL($3::text[])
-             OR u.assigned_site = (
-               SELECT name FROM sites WHERE id = $4 AND tenant_id = $2
-             )
+             OR u.assigned_site_id = $4
            )
-           AND ($5::boolean OR u.assigned_site = $6)`,
+           AND ($5::boolean OR u.assigned_site_id = $6::uuid)`,
 
         [
           task.assignedTo,
@@ -883,7 +1157,7 @@ router.post(
 
           userRequest.authUser.capabilities.includes("read_company"),
 
-          userRequest.authUser.assignedSite,
+          userRequest.authUser.assignedSiteId,
         ],
       )
 
@@ -959,7 +1233,7 @@ router.patch(
            $4::boolean
            OR (
              site_id IN (
-               SELECT id FROM sites WHERE tenant_id = $3 AND name = $7
+               SELECT id FROM sites WHERE tenant_id = $3 AND id = $7::uuid
              )
              AND ($6::boolean OR assigned_to = $5)
            )
@@ -979,7 +1253,7 @@ router.patch(
 
         canManageAssignedSite,
 
-        userRequest.authUser.assignedSite,
+        userRequest.authUser.assignedSiteId,
       ],
     )
 
@@ -1029,7 +1303,7 @@ router.get(
        JOIN sites s ON s.id = r.site_id AND s.tenant_id = r.tenant_id
        JOIN users u ON u.id = r.author_id
        WHERE r.tenant_id = $1
-         AND ($2::boolean OR s.name = $3)
+         AND ($2::boolean OR s.id = $3::uuid)
          AND (NOT $4::boolean OR r.status = 'Validé')
        ORDER BY r.report_date DESC, r.created_at DESC`,
 
@@ -1038,7 +1312,7 @@ router.get(
 
         canReadAll,
 
-        userRequest.authUser.assignedSite,
+        userRequest.authUser.assignedSiteId,
 
         validatedReportsOnly,
       ],
@@ -1076,7 +1350,8 @@ router.post(
     const site = await pool.query(
       `SELECT 1 FROM sites
        WHERE id = $1 AND tenant_id = $2
-         AND ($3::boolean OR name = $4)`,
+         AND ($3::boolean OR id = $4::uuid)
+         AND status <> 'Archivé'`,
 
       [
         report.siteId,
@@ -1085,7 +1360,7 @@ router.post(
 
         userRequest.authUser.capabilities.includes("read_company"),
 
-        userRequest.authUser.assignedSite,
+        userRequest.authUser.assignedSiteId,
       ],
     )
 
@@ -1143,7 +1418,7 @@ router.post(
          AND (
            $4::boolean
            OR site_id IN (
-             SELECT id FROM sites WHERE tenant_id = $3 AND name = $5
+             SELECT id FROM sites WHERE tenant_id = $3 AND id = $5::uuid
            )
          )
        RETURNING id, status, validated_at AS "validatedAt"`,
@@ -1157,7 +1432,7 @@ router.post(
 
         userRequest.authUser.capabilities.includes("read_company"),
 
-        userRequest.authUser.assignedSite,
+        userRequest.authUser.assignedSiteId,
       ],
     )
 
@@ -1196,10 +1471,10 @@ router.get(
        JOIN sites s ON s.id = p.site_id AND s.tenant_id = p.tenant_id
        JOIN users u ON u.id = p.author_id AND u.tenant_id = p.tenant_id
        WHERE p.tenant_id = $1
-         AND ($2::boolean OR s.name = $3)
+         AND ($2::boolean OR s.id = $3::uuid)
        ORDER BY p.captured_at DESC`,
 
-      [tenantId, canReadCompany, userRequest.authUser.assignedSite],
+      [tenantId, canReadCompany, userRequest.authUser.assignedSiteId],
     )
 
     response.json({ data: result.rows })
@@ -1235,9 +1510,10 @@ router.get(
        FROM photos p
        JOIN sites s ON s.id = p.site_id AND s.tenant_id = p.tenant_id
        WHERE p.id = $1 AND p.tenant_id = $2
-         AND ($3::boolean OR s.name = $4)`,
+         AND ($3::boolean OR s.id = $4::uuid)
+         AND s.status <> 'Archivé'`,
 
-      [id.data, tenantId, canReadCompany, userRequest.authUser.assignedSite],
+      [id.data, tenantId, canReadCompany, userRequest.authUser.assignedSiteId],
     )
 
     const photo = result.rows[0]
@@ -1322,7 +1598,8 @@ router.post(
     const site = await pool.query(
       `SELECT id, name FROM sites
        WHERE id = $1 AND tenant_id = $2
-         AND ($3::boolean OR name = $4)`,
+         AND ($3::boolean OR id = $4::uuid)
+         AND status <> 'Archivé'`,
 
       [
         photo.siteId,
@@ -1331,7 +1608,7 @@ router.post(
 
         userRequest.authUser.capabilities.includes("read_company"),
 
-        userRequest.authUser.assignedSite,
+        userRequest.authUser.assignedSiteId,
       ],
     )
 
@@ -1452,7 +1729,7 @@ router.post(
       return
     }
 
-    if (!userRequest.authUser.assignedSite) {
+    if (!userRequest.authUser.assignedSiteId) {
       response
         .status(403)
         .json({ error: "Aucun chantier n’est affecté à votre compte." })
@@ -1461,9 +1738,9 @@ router.post(
     }
 
     const site = await pool.query(
-      "SELECT id FROM sites WHERE tenant_id = $1 AND name = $2 AND status = 'En cours'",
+      "SELECT id FROM sites WHERE tenant_id = $1 AND id = $2::uuid AND status = 'En cours'",
 
-      [tenantId, userRequest.authUser.assignedSite],
+      [tenantId, userRequest.authUser.assignedSiteId],
     )
 
     if (!site.rowCount) {
@@ -1486,8 +1763,10 @@ router.post(
       return
     }
 
+    const client = await pool.connect()
     try {
-      const result = await pool.query(
+      await client.query("BEGIN")
+      const result = await client.query(
         `INSERT INTO attendance_records (
            tenant_id, user_id, site_id, clock_in_latitude, clock_in_longitude
          )
@@ -1506,9 +1785,22 @@ router.post(
           longitude,
         ],
       )
-
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "attendance",
+        targetId: result.rows[0].id,
+        action: "ATTENDANCE_CLOCKED_IN",
+        payloadMasked: {
+          siteId: result.rows[0].siteId,
+          locationProvided: latitude !== null,
+        },
+      })
+      await client.query("COMMIT")
       response.status(201).json({ data: result.rows[0] })
     } catch (error) {
+      await client.query("ROLLBACK")
       if (
         typeof error === "object" &&
         error !== null &&
@@ -1523,6 +1815,8 @@ router.post(
       }
 
       throw error
+    } finally {
+      client.release()
     }
   },
 )
@@ -1559,35 +1853,54 @@ router.post(
       return
     }
 
-    const result = await pool.query(
-      `UPDATE attendance_records
-       SET clock_out_at = now(), clock_out_latitude = $1, clock_out_longitude = $2
-       WHERE tenant_id = $3 AND user_id = $4 AND clock_out_at IS NULL
-       RETURNING id, site_id AS "siteId", clock_in_at AS "clockInAt",
-                 clock_out_at AS "clockOutAt",
-                 (SELECT name FROM sites WHERE id = attendance_records.site_id AND tenant_id = attendance_records.tenant_id) AS "siteName",
-                 clock_in_latitude AS "clockInLatitude",
-                 clock_in_longitude AS "clockInLongitude",
-                 clock_out_latitude AS "clockOutLatitude",
-                 clock_out_longitude AS "clockOutLongitude"`,
-
-      [latitude, longitude, tenantId, userRequest.authUser.id],
-    )
-
-    if (!result.rowCount) {
-      response.status(404).json({ error: "Aucun pointage ouvert à clôturer." })
-
-      return
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const result = await client.query(
+        `UPDATE attendance_records
+         SET clock_out_at = now(), clock_out_latitude = $1, clock_out_longitude = $2
+         WHERE tenant_id = $3 AND user_id = $4 AND clock_out_at IS NULL
+         RETURNING id, site_id AS "siteId", clock_in_at AS "clockInAt",
+                   clock_out_at AS "clockOutAt",
+                   (SELECT name FROM sites WHERE id = attendance_records.site_id AND tenant_id = attendance_records.tenant_id) AS "siteName",
+                   clock_in_latitude AS "clockInLatitude",
+                   clock_in_longitude AS "clockInLongitude",
+                   clock_out_latitude AS "clockOutLatitude",
+                   clock_out_longitude AS "clockOutLongitude"`,
+        [latitude, longitude, tenantId, userRequest.authUser.id],
+      )
+      if (!result.rowCount) {
+        await client.query("ROLLBACK")
+        response.status(404).json({ error: "Aucun pointage ouvert à clôturer." })
+        return
+      }
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "attendance",
+        targetId: result.rows[0].id,
+        action: "ATTENDANCE_CLOCKED_OUT",
+        payloadMasked: {
+          siteId: result.rows[0].siteId,
+          locationProvided: latitude !== null,
+        },
+      })
+      await client.query("COMMIT")
+      response.json({ data: result.rows[0] })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
     }
-
-    response.json({ data: result.rows[0] })
   },
 )
 
 router.get(
   "/finance",
 
-  requireAnyCapability("manage_finance"),
+  requireAnyCapability("manage_finance", "read_finance"),
 
   async (request, response) => {
     const userRequest = request as AuthenticatedRequest
@@ -1669,37 +1982,52 @@ router.post(
       return
     }
 
-    const result = await pool.query(
-      `INSERT INTO finance_entries (
-         tenant_id, site_id, created_by, entry_type, category, description,
-         amount_fcfa, due_date
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, site_id AS "siteId", entry_type AS "entryType", category,
-                 description, amount_fcfa AS "amountFcfa", status,
-                 due_date AS "dueDate", occurred_at AS "occurredAt",
-                 created_at AS "createdAt"`,
-
-      [
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const result = await client.query(
+        `INSERT INTO finance_entries (
+           tenant_id, site_id, created_by, entry_type, category, description,
+           amount_fcfa, due_date
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id, site_id AS "siteId", entry_type AS "entryType", category,
+                   description, amount_fcfa AS "amountFcfa", status,
+                   due_date AS "dueDate", occurred_at AS "occurredAt",
+                   created_at AS "createdAt"`,
+        [
+          tenantId,
+          entry.siteId,
+          userRequest.authUser.id,
+          entry.entryType,
+          entry.category,
+          entry.description,
+          entry.amountFcfa,
+          entry.dueDate ?? null,
+        ],
+      )
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
         tenantId,
-
-        entry.siteId,
-
-        userRequest.authUser.id,
-
-        entry.entryType,
-
-        entry.category,
-
-        entry.description,
-
-        entry.amountFcfa,
-
-        entry.dueDate ?? null,
-      ],
-    )
-
-    response.status(201).json({ data: result.rows[0] })
+        targetType: "finance_entry",
+        targetId: result.rows[0].id,
+        action: "FINANCE_ENTRY_CREATED",
+        payloadMasked: {
+          entryType: entry.entryType,
+          category: entry.category,
+          amountFcfa: entry.amountFcfa,
+          siteId: entry.siteId,
+        },
+      })
+      await client.query("COMMIT")
+      response.status(201).json({ data: result.rows[0] })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
   },
 )
 
@@ -1725,24 +2053,48 @@ router.post(
       return
     }
 
-    const result = await pool.query(
-      `UPDATE finance_entries
-       SET status = $1, occurred_at = now()
-       WHERE id = $2 AND tenant_id = $3 AND status = 'prévu'
-       RETURNING id, status, occurred_at AS "occurredAt"`,
-
-      [parsed.data.status, id.data, tenantId],
-    )
-
-    if (!result.rowCount) {
-      response
-        .status(404)
-        .json({ error: "Opération financière prévue introuvable." })
-
-      return
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const result = await client.query(
+        `UPDATE finance_entries
+         SET status = $1, occurred_at = now()
+         WHERE id = $2 AND tenant_id = $3 AND status = 'prévu'
+         RETURNING id, site_id AS "siteId", entry_type AS "entryType",
+                   category, amount_fcfa AS "amountFcfa", status,
+                   occurred_at AS "occurredAt"`,
+        [parsed.data.status, id.data, tenantId],
+      )
+      if (!result.rowCount) {
+        await client.query("ROLLBACK")
+        response
+          .status(404)
+          .json({ error: "Opération financière prévue introuvable." })
+        return
+      }
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "finance_entry",
+        targetId: id.data,
+        action: "FINANCE_ENTRY_REALIZED",
+        payloadMasked: {
+          entryType: result.rows[0].entryType,
+          category: result.rows[0].category,
+          amountFcfa: result.rows[0].amountFcfa,
+          siteId: result.rows[0].siteId,
+          status: result.rows[0].status,
+        },
+      })
+      await client.query("COMMIT")
+      response.json({ data: result.rows[0] })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
     }
-
-    response.json({ data: result.rows[0] })
   },
 )
 

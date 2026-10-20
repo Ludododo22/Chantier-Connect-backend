@@ -12,6 +12,7 @@ export type Capability =
   | "clock_in"
   | "update_assigned_tasks"
   | "manage_finance"
+  | "read_finance"
   | "read_company"
   | "read_assigned"
   | "read_team"
@@ -39,6 +40,10 @@ export interface AuthUser {
   tenantName: string
   tenantPlan: string
   assignedSite: string | null
+  assignedSiteId: string | null
+  sessionVersion: number
+  requiresUserConsent: boolean
+  sensitiveDataConsented: boolean
   sections: string[]
   capabilities: Capability[]
   profilePhotoUrl: string | null

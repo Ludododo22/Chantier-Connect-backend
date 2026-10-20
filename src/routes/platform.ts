@@ -12,11 +12,47 @@ import { refreshPlatformRequestLimit } from "../platform-settings.js"
 
 import { roleAccess } from "../role-access.js"
 
+import { writeAuditLog } from "../audit-log.js"
+
+import platformUsersRouter from "./platform-users.js"
+
 import type { AuthenticatedRequest } from "../types.js"
 
 const router = Router()
 
 router.use(authenticate, requireAnyCapability("manage_platform"))
+
+router.use("/users", platformUsersRouter)
+
+router.get("/audit-logs", async (request, response) => {
+  const parsed = z.object({
+    page: z.coerce.number().int().min(1).default(1),
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+    action: z.string().trim().max(100).optional(),
+    tenantId: z.uuid().optional(),
+  }).safeParse(request.query)
+  if (!parsed.success) {
+    response.status(400).json({ error: "Filtres d’audit invalides." })
+    return
+  }
+  const { page, limit, action, tenantId } = parsed.data
+  const result = await pool.query(
+    `SELECT log.id, log.actor_id AS "actorId", actor.full_name AS "actorName",
+            log.actor_role AS "actorRole", log.tenant_id AS "tenantId",
+            tenant.name AS "tenantName", log.target_type AS "targetType",
+            log.target_id AS "targetId", log.action, log.payload_masked AS "payloadMasked",
+            log.ip, log.user_agent AS "userAgent", log.created_at AS "createdAt"
+     FROM audit_logs log
+     LEFT JOIN users actor ON actor.id = log.actor_id
+     LEFT JOIN tenants tenant ON tenant.id = log.tenant_id
+     WHERE ($1::text IS NULL OR log.action = $1)
+       AND ($2::uuid IS NULL OR log.tenant_id = $2)
+     ORDER BY log.created_at DESC
+     LIMIT $3 OFFSET $4`,
+    [action ?? null, tenantId ?? null, limit, (page - 1) * limit],
+  )
+  response.json({ data: result.rows, page, limit })
+})
 
 const tenantSchema = z.object({
   name: z.string().trim().min(2).max(160),
@@ -25,7 +61,13 @@ const tenantSchema = z.object({
 
   adminEmail: z.email().trim().toLowerCase(),
 
+  phone: z.string().trim().max(30).nullable().optional(),
+
   temporaryPassword: z.string().min(12).max(128),
+
+  planId: z.uuid(),
+
+  registrationRequestId: z.uuid().optional(),
 })
 
 const planSchema = z.object({
@@ -37,8 +79,13 @@ const planSchema = z.object({
 
   maxSites: z.number().int().positive().nullable(),
 
-  active: z.boolean().optional().default(true),
+  active: z.boolean().optional(),
 })
+
+const planUpdateSchema = planSchema.partial().refine(
+  (plan) => Object.keys(plan).length > 0,
+  { message: "Au moins un champ du plan doit être fourni." },
+)
 
 const subscriptionSchema = z.object({
   planId: z.uuid(),
@@ -49,7 +96,7 @@ const subscriptionSchema = z.object({
 })
 
 const registrationRequestStatusSchema = z.object({
-  status: z.enum(["Nouvelle", "En cours", "Entreprise créée", "Refusée"]),
+  status: z.enum(["Nouvelle", "En cours", "Refusée"]),
 })
 
 const invoiceSchema = z.object({
@@ -149,6 +196,73 @@ router.get("/tenants", async (_request, response) => {
   response.json({ data: result.rows })
 })
 
+router.get("/tenants/:id", async (request, response) => {
+  const id = z.uuid().safeParse(request.params.id)
+  if (!id.success) {
+    response.status(400).json({ error: "Identifiant d’entreprise invalide." })
+    return
+  }
+  const result = await pool.query(
+    `SELECT t.id, t.name, t.status, t.created_at AS "createdAt",
+            p.id AS "planId", p.name AS "planName",
+            s.status AS "subscriptionStatus", s.renews_at AS "renewsAt",
+            (SELECT count(*)::int FROM users u WHERE u.tenant_id = t.id AND u.active) AS "userCount",
+            (SELECT count(*)::int FROM sites x WHERE x.tenant_id = t.id) AS "siteCount",
+            (SELECT count(*)::int FROM sites x WHERE x.tenant_id = t.id AND x.status <> 'Archivé') AS "activeSiteCount"
+     FROM tenants t
+     LEFT JOIN tenant_subscriptions s ON s.tenant_id = t.id
+     LEFT JOIN subscription_plans p ON p.id = s.plan_id
+     WHERE t.id = $1`,
+    [id.data],
+  )
+  if (!result.rowCount) {
+    response.status(404).json({ error: "Entreprise introuvable." })
+    return
+  }
+  response.json({ data: result.rows[0] })
+})
+
+const tenantUpdateSchema = z.object({
+  name: z.string().trim().min(2).max(160).optional(),
+  status: z.enum(["Actif", "Essai", "Impayé", "Suspendu", "Archivé"]).optional(),
+}).refine((value) => value.name !== undefined || value.status !== undefined)
+
+router.patch("/tenants/:id", async (request, response) => {
+  const id = z.uuid().safeParse(request.params.id)
+  const parsed = tenantUpdateSchema.safeParse(request.body)
+  if (!id.success || !parsed.success) {
+    response.status(400).json({ error: "Mise à jour d’entreprise invalide." })
+    return
+  }
+  const editor = (request as AuthenticatedRequest).authUser
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    const result = await client.query(
+      `UPDATE tenants SET name = COALESCE($2, name), status = COALESCE($3, status)
+       WHERE id = $1 RETURNING id, name, status`,
+      [id.data, parsed.data.name ?? null, parsed.data.status ?? null],
+    )
+    if (!result.rowCount) {
+      await client.query("ROLLBACK")
+      response.status(404).json({ error: "Entreprise introuvable." })
+      return
+    }
+    await writeAuditLog(client, request, {
+      actorId: editor.id, actorRole: editor.role, tenantId: id.data,
+      targetType: "tenant", targetId: id.data, action: "TENANT_UPDATED",
+      payloadMasked: parsed.data,
+    })
+    await client.query("COMMIT")
+    response.json({ data: result.rows[0] })
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  } finally {
+    client.release()
+  }
+})
+
 router.get("/registration-requests", async (_request, response) => {
   const result = await pool.query(
     `SELECT id, company_name AS "companyName",
@@ -180,13 +294,23 @@ router.patch("/registration-requests/:id", async (request, response) => {
   const result = await pool.query(
     `UPDATE registration_requests
      SET status = $2, reviewed_by = $3, updated_at = now()
-     WHERE id = $1
+     WHERE id = $1 AND status != 'Entreprise créée'
      RETURNING id, status, updated_at AS "updatedAt"`,
     [id.data, parsed.data.status, editor.id],
   )
 
   if (!result.rowCount) {
-    response.status(404).json({ error: "Demande introuvable." })
+    const existing = await pool.query(
+      "SELECT status FROM registration_requests WHERE id = $1",
+      [id.data],
+    )
+    if (!existing.rowCount) {
+      response.status(404).json({ error: "Demande introuvable." })
+      return
+    }
+    response.status(409).json({
+      error: "Une demande convertie en entreprise ne peut plus être modifiée.",
+    })
     return
   }
 
@@ -345,16 +469,36 @@ router.post("/tenants", async (request, response) => {
   try {
     await client.query("BEGIN")
 
+    if (input.registrationRequestId) {
+      const registrationRequest = await client.query(
+        `SELECT id FROM registration_requests
+         WHERE id = $1 AND tenant_id IS NULL AND status IN ('Nouvelle', 'En cours')
+         FOR UPDATE`,
+        [input.registrationRequestId],
+      )
+
+      if (!registrationRequest.rowCount) {
+        await client.query("ROLLBACK")
+        response.status(409).json({
+          error: "Cette demande a déjà été traitée ou n’est plus disponible.",
+        })
+        return
+      }
+    }
+
     const planResult = await client.query(
-      "SELECT id, name FROM subscription_plans WHERE name = 'Plan PME' AND active",
+      "SELECT id, name FROM subscription_plans WHERE id = $1 AND active",
+      [input.planId],
     )
 
     const plan = planResult.rows[0]
 
     if (!plan) {
-      throw new Error(
-        "Le plan par défaut « Plan PME » est introuvable ou inactif.",
-      )
+      await client.query("ROLLBACK")
+      response.status(400).json({
+        error: "Le plan choisi est introuvable ou inactif.",
+      })
+      return
     }
 
     const tenantResult = await client.query(
@@ -368,16 +512,24 @@ router.post("/tenants", async (request, response) => {
     const tenant = tenantResult.rows[0]
 
     await client.query(
+      `INSERT INTO tenant_settings (tenant_id, legal_name)
+       VALUES ($1, $2)`,
+      [tenant.id, tenant.name],
+    )
+
+    await client.query(
       `INSERT INTO users (
-         tenant_id, email, password_hash, full_name, initials, role,
+         tenant_id, email, phone, password_hash, full_name, initials, role,
          role_label, tenant_name, tenant_plan, sections, capabilities
        )
-       VALUES ($1, $2, $3, $4, $5, 'ADMIN_ENTERPRISE', $6, $7, $8, $9, $10)`,
+       VALUES ($1, $2, $3, $4, $5, $6, 'ADMIN_ENTERPRISE', $7, $8, $9, $10, $11)`,
 
       [
         tenant.id,
 
         input.adminEmail,
+
+        input.phone || null,
 
         passwordHash,
 
@@ -403,6 +555,33 @@ router.post("/tenants", async (request, response) => {
 
       [tenant.id, plan.id],
     )
+
+    if (input.registrationRequestId) {
+      const linked = await client.query(
+        `UPDATE registration_requests
+         SET status = 'Entreprise créée', reviewed_by = $2, tenant_id = $3, updated_at = now()
+         WHERE id = $1 AND tenant_id IS NULL AND status IN ('Nouvelle', 'En cours')`,
+        [input.registrationRequestId, editor.id, tenant.id],
+      )
+      if (!linked.rowCount) {
+        await client.query("ROLLBACK")
+        response.status(409).json({ error: "Cette demande a déjà été convertie." })
+        return
+      }
+    }
+
+    await writeAuditLog(client, request, {
+      actorId: editor.id,
+      actorRole: editor.role,
+      tenantId: tenant.id,
+      targetType: "tenant",
+      targetId: tenant.id,
+      action: "TENANT_CREATED",
+      payloadMasked: {
+        name: tenant.name,
+        registrationRequestId: input.registrationRequestId ?? null,
+      },
+    })
 
     await client.query("COMMIT")
 
@@ -440,7 +619,10 @@ router.patch("/tenants/:id/subscription", async (request, response) => {
     return
   }
 
-  const { planId, status } = parsed.data
+  const { planId, status, renewsAt } = parsed.data
+  const requiresActivePlan = status === "Actif" || status === "Essai"
+
+  const editor = (request as AuthenticatedRequest).authUser
 
   const client = await pool.connect()
 
@@ -448,9 +630,9 @@ router.patch("/tenants/:id/subscription", async (request, response) => {
     await client.query("BEGIN")
 
     const plan = await client.query(
-      "SELECT name FROM subscription_plans WHERE id = $1 AND active",
-
-      [planId],
+      `SELECT name FROM subscription_plans
+       WHERE id = $1 AND ($2::boolean = false OR active)`,
+      [planId, requiresActivePlan],
     )
 
     if (!plan.rowCount) {
@@ -463,8 +645,22 @@ router.patch("/tenants/:id/subscription", async (request, response) => {
       return
     }
 
+    if (requiresActivePlan) {
+      const validity = await client.query<{ valid: boolean }>(
+        "SELECT $1::date >= CURRENT_DATE AS valid",
+        [renewsAt],
+      )
+      if (!validity.rows[0]?.valid) {
+        await client.query("ROLLBACK")
+        response.status(400).json({
+          error: "Une date de fin de validité égale ou postérieure à aujourd’hui est obligatoire pour activer l’abonnement.",
+        })
+        return
+      }
+    }
+
     const tenant = await client.query(
-      `UPDATE tenants SET plan = $2, status = $3
+      `UPDATE tenants SET plan = $2, status = CASE WHEN status = 'Archivé' THEN status ELSE $3 END
        WHERE id = $1 RETURNING id`,
 
       [id.data, plan.rows[0].name, status === "Résilié" ? "Suspendu" : status],
@@ -488,8 +684,18 @@ router.patch("/tenants/:id/subscription", async (request, response) => {
        RETURNING tenant_id AS "tenantId", plan_id AS "planId",
                  status, renews_at AS "renewsAt"`,
 
-      [id.data, planId, status, parsed.data.renewsAt],
+      [id.data, planId, status, renewsAt],
     )
+
+    await writeAuditLog(client, request, {
+      actorId: editor.id,
+      actorRole: editor.role,
+      tenantId: id.data,
+      targetType: "tenant_subscription",
+      targetId: id.data,
+      action: "TENANT_SUBSCRIPTION_UPDATED",
+      payloadMasked: { planId, status, renewsAt },
+    })
 
     await client.query("COMMIT")
 
@@ -543,7 +749,7 @@ router.post("/plans", async (request, response) => {
         plan.monthlyPriceFcfa,
         plan.maxUsers,
         plan.maxSites,
-        plan.active,
+        plan.active ?? true,
       ],
     )
 
@@ -567,7 +773,7 @@ router.post("/plans", async (request, response) => {
 router.patch("/plans/:id", async (request, response) => {
   const id = z.uuid().safeParse(request.params.id)
 
-  const parsed = planSchema.safeParse(request.body)
+  const parsed = planUpdateSchema.safeParse(request.body)
 
   if (!id.success || !parsed.success) {
     response.status(400).json({ error: "Données du plan invalides." })
@@ -578,31 +784,60 @@ router.patch("/plans/:id", async (request, response) => {
   try {
     const plan = parsed.data
 
-    const result = await pool.query(
+    const editor = (request as AuthenticatedRequest).authUser
+    const client = await pool.connect()
+    let result
+    try {
+      await client.query("BEGIN")
+      result = await client.query(
       `UPDATE subscription_plans
-       SET name = $2, monthly_price_fcfa = $3, max_users = $4, max_sites = $5,
-           active = $6
+       SET name = CASE WHEN $2::boolean THEN $3 ELSE name END,
+           monthly_price_fcfa = CASE WHEN $4::boolean THEN $5 ELSE monthly_price_fcfa END,
+           max_users = CASE WHEN $6::boolean THEN $7::integer ELSE max_users END,
+           max_sites = CASE WHEN $8::boolean THEN $9::integer ELSE max_sites END,
+           active = CASE WHEN $10::boolean THEN $11 ELSE active END
        WHERE id = $1
        RETURNING id, name, monthly_price_fcfa AS "monthlyPriceFcfa",
                  max_users AS "maxUsers", max_sites AS "maxSites", active`,
 
       [
         id.data,
-        plan.name,
-        plan.monthlyPriceFcfa,
-        plan.maxUsers,
-        plan.maxSites,
-        plan.active,
+        plan.name !== undefined,
+        plan.name ?? null,
+        plan.monthlyPriceFcfa !== undefined,
+        plan.monthlyPriceFcfa ?? null,
+        plan.maxUsers !== undefined,
+        plan.maxUsers ?? null,
+        plan.maxSites !== undefined,
+        plan.maxSites ?? null,
+        plan.active !== undefined,
+        plan.active ?? null,
       ],
     )
 
-    if (!result.rowCount) {
-      response.status(404).json({ error: "Plan introuvable." })
+      if (!result.rowCount) {
+        await client.query("ROLLBACK")
+        response.status(404).json({ error: "Plan introuvable." })
+        return
+      }
 
-      return
+      await writeAuditLog(client, request, {
+        actorId: editor.id,
+        actorRole: editor.role,
+        targetType: "subscription_plan",
+        targetId: id.data,
+        action: "SUBSCRIPTION_PLAN_UPDATED",
+        payloadMasked: plan,
+      })
+      await client.query("COMMIT")
+
+      response.json({ data: result.rows[0] })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
     }
-
-    response.json({ data: result.rows[0] })
   } catch (error) {
     if (
       typeof error === "object" &&

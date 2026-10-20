@@ -3,4 +3,5 @@ dist/
 .env
 .env.*
 !.env.example
+INFO_USERS*.md
 *.tsbuildinfo

@@ -318,6 +318,17 @@ async function seed() {
       )
     }
 
+    await client.query(
+      `UPDATE users u
+       SET assigned_site_id = (
+         SELECT s.id FROM sites s
+         WHERE s.tenant_id = u.tenant_id AND s.name = u.assigned_site
+         ORDER BY s.created_at, s.id LIMIT 1
+       )
+       WHERE u.tenant_id = $1 AND u.assigned_site IS NOT NULL`,
+      [tenantId],
+    )
+
     const tasks = [
       [
         "40000000-0000-4000-8000-000000000001",
