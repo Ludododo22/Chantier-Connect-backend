@@ -7,7 +7,9 @@ API Express/Node indépendante du frontend. Elle utilise PostgreSQL via `pg` et 
 Copiez `.env.example` vers `.env` en développement et renseignez :
 
 - `DATABASE_URL` : chaîne PostgreSQL Supabase (de préférence le pooler en mode session, port 5432).
-- `DATABASE_SSL=true` pour Supabase et la production.
+- `DATABASE_SSL=true` pour Supabase et la production. Le backend vérifie le
+  certificat TLS PostgreSQL avec le CA versionné `prod-ca-2021.crt`; gardez ce
+  fichier présent à la racine du projet déployé.
 - `JWT_SECRET` : clé aléatoire d’au moins 64 caractères en production.
 - `RESEND_API_KEY`, `EMAIL_FROM` et `APP_ORIGIN` : configuration facultative de l’envoi des liens de réinitialisation. `EMAIL_FROM` doit être une adresse/domaine validé par Resend et `APP_ORIGIN` l’origine HTTPS publique du frontend en production.
 - `NODE_ENV=production` et `PORT` (le port fourni par l’hébergeur).
