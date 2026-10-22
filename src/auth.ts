@@ -162,6 +162,11 @@ export async function authenticate(
     return
   }
 
+  if (row.session_version !== sessionVersion) {
+    response.status(401).json({ error: "Cette session a Ã©tÃ© rÃ©voquÃ©e." })
+    return
+  }
+
   if (
     row.must_change_password &&
     !(
@@ -173,11 +178,6 @@ export async function authenticate(
       error: "Vous devez remplacer votre mot de passe provisoire avant de continuer.",
       code: "PASSWORD_CHANGE_REQUIRED",
     })
-    return
-  }
-
-  if (row.session_version !== sessionVersion) {
-    response.status(401).json({ error: "Cette session a Ã©tÃ© rÃ©voquÃ©e." })
     return
   }
 

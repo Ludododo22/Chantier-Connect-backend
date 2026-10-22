@@ -302,10 +302,10 @@ async function seed() {
 
     for (const site of sites) {
       await client.query(
-        `INSERT INTO sites (id, tenant_id, name, location, progress, budget_fcfa)
+        `INSERT INTO sites (id, tenant_id, name, location, progress, cost_budget_fcfa)
          VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, location = EXCLUDED.location,
-           progress = EXCLUDED.progress, budget_fcfa = EXCLUDED.budget_fcfa`,
+           progress = EXCLUDED.progress, cost_budget_fcfa = EXCLUDED.cost_budget_fcfa`,
 
         [
           site.id,

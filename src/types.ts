@@ -12,6 +12,8 @@ export type Capability =
   | "clock_in"
   | "update_assigned_tasks"
   | "manage_finance"
+  | "manage_finance_planning"
+  | "manage_company_budget"
   | "read_finance"
   | "read_company"
   | "read_assigned"

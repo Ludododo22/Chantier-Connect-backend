@@ -14,8 +14,8 @@ export const roleAccess: Record<UserRole, RoleAccess> = {
   },
   ADMIN_ENTERPRISE: {
     label: "Administratrice entreprise",
-    sections: ["Tableau de bord", "Chantiers", "Mes tâches", "Photos", "Rapports", "Équipe", "Budget", "Dossiers de paiement", "Trésorerie", "Paramètres", "Profil"],
-    capabilities: ["manage_company", "manage_team", "manage_sites", "manage_tasks", "capture_photos", "create_reports", "validate_reports", "read_finance", "read_company"],
+    sections: ["Tableau de bord", "Chantiers", "Mes tâches", "Photos", "Rapports", "Équipe", "Budget", "Dossiers de paiement", "Trésorerie", "Factures fournisseurs", "Paramètres", "Profil"],
+    capabilities: ["manage_company", "manage_team", "manage_sites", "manage_tasks", "capture_photos", "create_reports", "validate_reports", "manage_finance_planning", "manage_company_budget", "read_finance", "read_company"],
   },
   CONDUCTEUR: {
     label: "Conducteur de travaux",
@@ -39,7 +39,7 @@ export const roleAccess: Record<UserRole, RoleAccess> = {
   },
   COMPTABLE: {
     label: "Comptable",
-    sections: ["Tableau de bord", "Dossiers de paiement", "Trésorerie", "Rapports", "Profil"],
+    sections: ["Tableau de bord", "Budget", "Dossiers de paiement", "Trésorerie", "Factures fournisseurs", "Rapports", "Profil"],
     capabilities: ["manage_finance", "read_company", "read_validated_reports"],
   },
   MAITRE_OUVRAGE: {

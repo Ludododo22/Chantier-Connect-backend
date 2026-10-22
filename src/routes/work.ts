@@ -190,16 +190,34 @@ const siteSchema = z.object({
 
   location: z.string().trim().min(2).max(160),
 
+  description: z.string().trim().max(4000).nullable().optional(),
+
+  city: z.string().trim().max(120).nullable().optional(),
+
+  province: z.string().trim().max(100).nullable().optional(),
+
+  clientName: z.string().trim().max(180).nullable().optional(),
+
+  workType: z.string().trim().max(120).nullable().optional(),
+
+  contractReference: z.string().trim().max(120).nullable().optional(),
+
   status: z.enum(["En cours", "En pause", "Terminé", "Archivé"]).default("En cours"),
 
-  progress: z.number().int().min(0).max(100).default(0),
+  costBudgetFcfa: z.number().int().min(0).max(9_000_000_000_000).optional(),
 
-  budgetFcfa: z.number().int().min(0).max(9_000_000_000_000).default(0),
+  budgetFcfa: z.number().int().min(0).max(9_000_000_000_000).optional(),
+
+  contractAmountFcfa: z.number().int().min(0).max(9_000_000_000_000).nullable().optional(),
 
   startDate: z.iso.date().nullable().optional(),
 
   endDate: z.iso.date().nullable().optional(),
-})
+  plannedDurationDays: z.number().int().min(1).max(3650).nullable().optional(),
+}).refine(
+  (site) => !site.startDate || !site.endDate || site.endDate >= site.startDate,
+  { path: ["endDate"], message: "L’échéance ne peut pas précéder la date de début." },
+)
 
 const taskSchema = z.object({
   siteId: z.uuid(),
@@ -273,6 +291,12 @@ const financeSchema = z.object({
 
 const financeStatusSchema = z.object({
   status: z.literal("réalisé"),
+})
+
+const companyOperatingBudgetSchema = z.object({
+  fiscalYear: z.number().int().min(2000).max(2100),
+  amountFcfa: z.number().int().min(0).max(9_000_000_000_000),
+  notes: z.string().trim().max(2000).default(""),
 })
 
 const tenantSettingsSchema = z.object({
@@ -843,12 +867,30 @@ router.get(
 
     const result = await pool.query(
       `SELECT s.id, s.name,
+               CASE WHEN $5::boolean THEN s.description ELSE NULL END AS description,
                CASE WHEN $5::boolean THEN s.location ELSE NULL END AS location,
+               CASE WHEN $5::boolean THEN s.city ELSE NULL END AS city,
+               CASE WHEN $5::boolean THEN s.province ELSE NULL END AS province,
+               CASE WHEN $5::boolean THEN s.client_name ELSE NULL END AS "clientName",
+               CASE WHEN $5::boolean THEN s.work_type ELSE NULL END AS "workType",
+               CASE WHEN $5::boolean THEN s.contract_reference ELSE NULL END AS "contractReference",
                CASE WHEN $5::boolean THEN s.status ELSE NULL END AS status,
-               CASE WHEN $5::boolean THEN s.progress ELSE NULL END AS progress,
-               CASE WHEN $4::boolean THEN s.budget_fcfa::text ELSE NULL END AS "budgetFcfa",
+               CASE WHEN $5::boolean THEN (
+                 SELECT CASE
+                   WHEN count(*) = 0 THEN 0
+                   ELSE round(
+                     100.0 * count(*) FILTER (WHERE task.status = 'Terminée') / count(*)
+                   )::integer
+                 END
+                 FROM tasks task
+                 WHERE task.site_id = s.id AND task.tenant_id = s.tenant_id
+               ) ELSE NULL END AS progress,
+               CASE WHEN $4::boolean THEN s.cost_budget_fcfa::text ELSE NULL END AS "costBudgetFcfa",
+               CASE WHEN $4::boolean THEN s.cost_budget_fcfa::text ELSE NULL END AS "budgetFcfa",
+               CASE WHEN $4::boolean THEN s.contract_amount_fcfa::text ELSE NULL END AS "contractAmountFcfa",
                CASE WHEN $5::boolean THEN s.start_date ELSE NULL END AS "startDate",
                CASE WHEN $5::boolean THEN s.end_date ELSE NULL END AS "endDate",
+               CASE WHEN $5::boolean THEN s.planned_duration_days ELSE NULL END AS "plannedDurationDays",
                s.created_at AS "createdAt",
                CASE WHEN $5::boolean THEN (
                  SELECT count(*)::integer FROM users assigned_user
@@ -887,9 +929,25 @@ router.get(
       return
     }
     const result = await pool.query(
-      `SELECT s.id, s.name, s.location, s.status, s.progress,
-              s.budget_fcfa AS "budgetFcfa", s.start_date AS "startDate",
-              s.end_date AS "endDate", s.created_at AS "createdAt",
+      `SELECT s.id, s.name, s.description, s.location, s.city, s.province,
+              s.client_name AS "clientName", s.work_type AS "workType",
+              s.contract_reference AS "contractReference",
+              s.status,
+              (SELECT CASE
+                 WHEN count(*) = 0 THEN 0
+                 ELSE round(
+                   100.0 * count(*) FILTER (WHERE task.status = 'Terminée') / count(*)
+                 )::integer
+               END
+               FROM tasks task
+               WHERE task.site_id = s.id AND task.tenant_id = s.tenant_id) AS progress,
+              s.cost_budget_fcfa AS "costBudgetFcfa",
+              s.cost_budget_fcfa AS "budgetFcfa",
+              s.contract_amount_fcfa AS "contractAmountFcfa",
+              s.start_date AS "startDate",
+              s.end_date AS "endDate",
+              s.planned_duration_days AS "plannedDurationDays",
+              s.created_at AS "createdAt",
               COALESCE(jsonb_agg(jsonb_build_object(
                 'id', u.id, 'fullName', u.full_name, 'role', u.role, 'active', u.active
               )) FILTER (WHERE u.id IS NOT NULL), '[]'::jsonb) AS "assignedTeam",
@@ -953,21 +1011,41 @@ router.post(
         return
       }
       result = await client.query(
-      `INSERT INTO sites (tenant_id, name, location, status, progress, budget_fcfa, start_date, end_date)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, name, location, status, progress, budget_fcfa AS "budgetFcfa",
-                 start_date AS "startDate", end_date AS "endDate", created_at AS "createdAt",
+      `INSERT INTO sites (
+         tenant_id, name, description, location, city, province, client_name,
+         work_type, contract_reference, status, cost_budget_fcfa,
+         contract_amount_fcfa,
+         start_date, end_date, planned_duration_days
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+       RETURNING id, name, description, location, city, province,
+                 client_name AS "clientName", work_type AS "workType",
+                 contract_reference AS "contractReference",
+                 status, 0::integer AS progress,
+                 cost_budget_fcfa AS "costBudgetFcfa",
+                 cost_budget_fcfa AS "budgetFcfa",
+                 contract_amount_fcfa AS "contractAmountFcfa",
+                 start_date AS "startDate", end_date AS "endDate",
+                 planned_duration_days AS "plannedDurationDays",
+                 created_at AS "createdAt",
                  0::integer AS "teamCount"`,
 
       [
         tenantId,
         site.name,
+        site.description ?? null,
         site.location,
+        site.city ?? null,
+        site.province ?? null,
+        site.clientName ?? null,
+        site.workType ?? null,
+        site.contractReference ?? null,
         site.status,
-        site.progress,
-        site.budgetFcfa,
+        site.costBudgetFcfa ?? site.budgetFcfa ?? 0,
+        site.contractAmountFcfa ?? null,
         site.startDate ?? null,
         site.endDate ?? null,
+        site.plannedDurationDays ?? null,
       ],
       )
 
@@ -1010,18 +1088,58 @@ router.patch(
     try {
       await client.query("BEGIN")
       const result = await client.query(
-        `UPDATE sites SET name = $1, location = $2, status = $3, progress = $4,
-                budget_fcfa = $5, start_date = $6, end_date = $7
-         WHERE id = $8 AND tenant_id = $9
-         RETURNING id, name, location, status, progress, budget_fcfa AS "budgetFcfa",
-                   start_date AS "startDate", end_date AS "endDate", created_at AS "createdAt"`,
-        [site.name, site.location, site.status, site.progress, site.budgetFcfa, site.startDate ?? null, site.endDate ?? null, id.data, tenantId],
+        `UPDATE sites
+         SET name = $1, description = $2, location = $3, city = $4, province = $5,
+             client_name = $6, work_type = $7, contract_reference = $8,
+             status = $9, cost_budget_fcfa = $10, contract_amount_fcfa = $11,
+             start_date = $12, end_date = $13, planned_duration_days = $14,
+             budget_fcfa = $10
+         WHERE id = $15 AND tenant_id = $16
+         RETURNING id, name, description, location, city, province,
+                   client_name AS "clientName", work_type AS "workType",
+                   contract_reference AS "contractReference",
+                   status, cost_budget_fcfa AS "costBudgetFcfa",
+                   cost_budget_fcfa AS "budgetFcfa",
+                   contract_amount_fcfa AS "contractAmountFcfa",
+                   start_date AS "startDate", end_date AS "endDate",
+                   planned_duration_days AS "plannedDurationDays",
+                   created_at AS "createdAt"`,
+        [
+          site.name,
+          site.description ?? null,
+          site.location,
+          site.city ?? null,
+          site.province ?? null,
+          site.clientName ?? null,
+          site.workType ?? null,
+          site.contractReference ?? null,
+          site.status,
+          site.costBudgetFcfa ?? site.budgetFcfa ?? 0,
+          site.contractAmountFcfa ?? null,
+          site.startDate ?? null,
+          site.endDate ?? null,
+          site.plannedDurationDays ?? null,
+          id.data,
+          tenantId,
+        ],
       )
       if (!result.rowCount) {
         await client.query("ROLLBACK")
         response.status(404).json({ error: "Chantier introuvable." })
         return
       }
+      const progress = await client.query<{ progress: number }>(
+        `SELECT CASE
+           WHEN count(*) = 0 THEN 0
+           ELSE round(
+             100.0 * count(*) FILTER (WHERE status = 'Terminée') / count(*)
+           )::integer
+         END AS progress
+         FROM tasks
+         WHERE site_id = $1 AND tenant_id = $2`,
+        [id.data, tenantId],
+      )
+      result.rows[0].progress = progress.rows[0]!.progress
       await writeAuditLog(client, request, {
         actorId: userRequest.authUser.id,
         actorRole: userRequest.authUser.role,
@@ -1936,7 +2054,8 @@ router.get(
 
       pool.query(
         `SELECT
-           COALESCE((SELECT SUM(budget_fcfa) FROM sites WHERE tenant_id = $1), 0)::text AS "budgetFcfa",
+           COALESCE((SELECT SUM(cost_budget_fcfa) FROM sites WHERE tenant_id = $1), 0)::text AS "costBudgetFcfa",
+           COALESCE((SELECT SUM(cost_budget_fcfa) FROM sites WHERE tenant_id = $1), 0)::text AS "budgetFcfa",
            COALESCE(SUM(amount_fcfa) FILTER (WHERE entry_type = 'engagement'), 0)::text AS "engagedFcfa",
            COALESCE(SUM(amount_fcfa) FILTER (WHERE entry_type = 'depense' AND status = 'réalisé'), 0)::text AS "expensesFcfa",
            COALESCE(SUM(amount_fcfa) FILTER (WHERE entry_type = 'encaissement' AND status = 'prévu'), 0)::text AS "plannedReceiptsFcfa",
@@ -1956,7 +2075,7 @@ router.get(
 router.post(
   "/finance",
 
-  requireAnyCapability("manage_finance"),
+  requireAnyCapability("manage_finance", "manage_finance_planning"),
 
   async (request, response) => {
     const userRequest = request as AuthenticatedRequest
@@ -2042,6 +2161,187 @@ router.post(
   },
 )
 
+router.get(
+  "/company-operating-budget",
+  requireAnyCapability("manage_company_budget", "manage_finance", "read_finance"),
+  async (request, response) => {
+    const userRequest = request as AuthenticatedRequest
+    const tenantId = requireTenant(userRequest, response)
+    if (!tenantId) return
+    const year = z.coerce.number().int().min(2000).max(2100).safeParse(
+      request.query.year ?? new Date().getFullYear(),
+    )
+    if (!year.success) {
+      response.status(400).json({ error: "Exercice budgétaire invalide." })
+      return
+    }
+    const result = await pool.query(
+      `SELECT fiscal_year AS "fiscalYear", amount_fcfa::text AS "amountFcfa",
+              notes, updated_at AS "updatedAt"
+       FROM company_operating_budgets
+       WHERE tenant_id = $1 AND fiscal_year = $2`,
+      [tenantId, year.data],
+    )
+    response.json({
+      data: result.rows[0] ?? {
+        fiscalYear: year.data,
+        amountFcfa: null,
+        notes: "",
+        updatedAt: null,
+      },
+    })
+  },
+)
+
+router.put(
+  "/company-operating-budget",
+  requireAnyCapability("manage_company_budget"),
+  async (request, response) => {
+    const userRequest = request as AuthenticatedRequest
+    const tenantId = requireTenant(userRequest, response)
+    if (!tenantId) return
+    const parsed = companyOperatingBudgetSchema.safeParse(request.body)
+    if (!parsed.success) {
+      response.status(400).json({
+        error: "Budget annuel de l’entreprise invalide.",
+        details: parsed.error.flatten().fieldErrors,
+      })
+      return
+    }
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const result = await client.query(
+        `INSERT INTO company_operating_budgets (
+           tenant_id, fiscal_year, amount_fcfa, notes, updated_by
+         )
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (tenant_id, fiscal_year) DO UPDATE SET
+           amount_fcfa = EXCLUDED.amount_fcfa, notes = EXCLUDED.notes,
+           updated_by = EXCLUDED.updated_by, updated_at = now()
+         RETURNING id, fiscal_year AS "fiscalYear",
+                   amount_fcfa::text AS "amountFcfa", notes,
+                   updated_at AS "updatedAt"`,
+        [
+          tenantId,
+          parsed.data.fiscalYear,
+          parsed.data.amountFcfa,
+          parsed.data.notes,
+          userRequest.authUser.id,
+        ],
+      )
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "company_operating_budget",
+        targetId: result.rows[0].id,
+        action: "COMPANY_OPERATING_BUDGET_UPDATED",
+        payloadMasked: {
+          fiscalYear: parsed.data.fiscalYear,
+          amountFcfa: parsed.data.amountFcfa,
+        },
+      })
+      await client.query("COMMIT")
+      response.json({ data: result.rows[0] })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  },
+)
+
+router.patch(
+  "/finance/:id",
+  requireAnyCapability("manage_finance", "manage_finance_planning"),
+  async (request, response) => {
+    const userRequest = request as AuthenticatedRequest
+    const tenantId = requireTenant(userRequest, response)
+    if (!tenantId) return
+    const id = z.uuid().safeParse(request.params.id)
+    const parsed = financeSchema.safeParse(request.body)
+    if (!id.success || !parsed.success) {
+      response.status(400).json({ error: "Mise à jour financière invalide." })
+      return
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const current = await client.query<{ status: string }>(
+        "SELECT status FROM finance_entries WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+        [id.data, tenantId],
+      )
+      if (!current.rowCount) {
+        await client.query("ROLLBACK")
+        response.status(404).json({ error: "Opération financière introuvable." })
+        return
+      }
+      if (current.rows[0]!.status !== "prévu") {
+        await client.query("ROLLBACK")
+        response.status(409).json({
+          error: "Une opération réalisée ne peut plus être modifiée.",
+        })
+        return
+      }
+      const site = await client.query(
+        "SELECT 1 FROM sites WHERE id = $1 AND tenant_id = $2",
+        [parsed.data.siteId, tenantId],
+      )
+      if (!site.rowCount) {
+        await client.query("ROLLBACK")
+        response
+          .status(404)
+          .json({ error: "Chantier introuvable dans votre entreprise." })
+        return
+      }
+      const result = await client.query(
+        `UPDATE finance_entries
+         SET site_id = $1, entry_type = $2, category = $3, description = $4,
+             amount_fcfa = $5, due_date = $6
+         WHERE id = $7 AND tenant_id = $8 AND status = 'prévu'
+         RETURNING id, site_id AS "siteId", entry_type AS "entryType", category,
+                   description, amount_fcfa AS "amountFcfa", status,
+                   due_date AS "dueDate", occurred_at AS "occurredAt",
+                   created_at AS "createdAt"`,
+        [
+          parsed.data.siteId,
+          parsed.data.entryType,
+          parsed.data.category,
+          parsed.data.description,
+          parsed.data.amountFcfa,
+          parsed.data.dueDate ?? null,
+          id.data,
+          tenantId,
+        ],
+      )
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "finance_entry",
+        targetId: id.data,
+        action: "FINANCE_ENTRY_UPDATED",
+        payloadMasked: {
+          entryType: parsed.data.entryType,
+          category: parsed.data.category,
+          amountFcfa: parsed.data.amountFcfa,
+          siteId: parsed.data.siteId,
+        },
+      })
+      await client.query("COMMIT")
+      response.json({ data: result.rows[0] })
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  },
+)
+
 router.post(
   "/finance/:id/realize",
 
@@ -2071,6 +2371,7 @@ router.post(
         `UPDATE finance_entries
          SET status = $1, occurred_at = now()
          WHERE id = $2 AND tenant_id = $3 AND status = 'prévu'
+           AND entry_type <> 'engagement'
          RETURNING id, site_id AS "siteId", entry_type AS "entryType",
                    category, amount_fcfa AS "amountFcfa", status,
                    occurred_at AS "occurredAt"`,

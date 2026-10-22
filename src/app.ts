@@ -20,6 +20,8 @@ import paymentsRoutes from "./routes/payments.js"
 
 import platformRoutes from "./routes/platform.js"
 
+import supplierInvoiceRoutes from "./routes/supplier-invoices.js"
+
 import workRoutes from "./routes/work.js"
 
 const app = express()
@@ -55,6 +57,8 @@ app.use("/api/mobile-payments", mobilePaymentsRoutes)
 app.use("/api/platform", platformRoutes)
 
 app.use("/api/payments", paymentsRoutes)
+
+app.use("/api/supplier-invoices", supplierInvoiceRoutes)
 
 app.use("/api", workRoutes)
 

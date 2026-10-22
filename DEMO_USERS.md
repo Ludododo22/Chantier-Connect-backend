@@ -110,10 +110,11 @@ facultatif et demande l’autorisation du navigateur. Le pointage d’arrivée e
 départ est réservé aux comptes disposant de la capacité `clock_in` et n’autorise
 qu’un seul service ouvert par personne.
 
-Le budget et la trésorerie utilisent le budget contractuel des chantiers et les
-engagements, encaissements et dépenses enregistrés par les utilisateurs ayant
-la capacité `manage_finance`. Les opérations planifiées peuvent être marquées
-comme réalisées; les totaux sont recalculés à partir de PostgreSQL.
+Le suivi des coûts compare l’enveloppe de coûts prévue de chaque chantier aux
+engagements et dépenses enregistrés par les utilisateurs ayant la capacité
+`manage_finance`. Le montant contractuel facturé au client est distinct et
+représente une recette, pas une limite de coûts. Les opérations planifiées
+peuvent être marquées comme réalisées; les totaux sont recalculés à partir de PostgreSQL.
 
 Les dossiers de paiement sont enregistrés par entreprise avec une référence,
 un montant, un chantier et une transition de statut vérifiée par l’API. La
